@@ -18,7 +18,10 @@ jobs:
           python-version: "3.11"
 
       - name: Abhängigkeiten installieren
-        run: pip install --quiet boto3 edge-tts
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y ffmpeg
+          pip install --quiet boto3 edge-tts
 
       - name: Video rendern
         env:
