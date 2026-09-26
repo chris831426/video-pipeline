@@ -1,0 +1,33 @@
+name: Render Video
+
+on:
+  workflow_dispatch:
+    inputs:
+      video_id:
+        description: "ID des zu rendernden Videos"
+        required: true
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Abhängigkeiten installieren
+        run: pip install --quiet boto3 edge-tts
+
+      - name: Video rendern
+        env:
+          VIDEO_ID: ${{ github.event.inputs.video_id }}
+          B2_ENDPOINT: ${{ secrets.B2_ENDPOINT }}
+          B2_BUCKET: ${{ secrets.B2_BUCKET }}
+          B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
+          B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
+          TTS_VOICE_ID: ${{ vars.TTS_VOICE_ID }}
+          CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
+          CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
+        run: python render.py
