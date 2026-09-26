@@ -131,7 +131,12 @@ def main():
         }
     ).encode("utf-8")
     req = urllib.request.Request(
-        CALLBACK_URL, data=payload, headers={"Content-Type": "application/json"}
+        CALLBACK_URL,
+        data=payload,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; VideoPipelineBot/1.0)",
+        },
     )
     try:
         urllib.request.urlopen(req)
