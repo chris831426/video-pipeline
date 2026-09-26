@@ -17,7 +17,7 @@ CALLBACK_URL = os.environ["CALLBACK_URL"]
 CALLBACK_SECRET = os.environ["CALLBACK_SECRET"]
 
 FPS = 25
-RESOLUTION = "1080x1920"  # TikTok/Reels Hochformat
+WIDTH, HEIGHT = 1080, 1920  # TikTok/Reels Hochformat
 
 s3 = boto3.client(
     "s3",
@@ -76,9 +76,9 @@ def main():
             [
                 "ffmpeg", "-y", "-loop", "1", "-i", img_path, "-i", audio_path,
                 "-filter_complex",
-                f"[0:v]scale={RESOLUTION}:force_original_aspect_ratio=increase,"
-                f"crop={RESOLUTION},"
-                f"zoompan=z='min(zoom+0.0015,1.2)':d={frames}:s={RESOLUTION},"
+                f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
+                f"crop={WIDTH}:{HEIGHT},"
+                f"zoompan=z='min(zoom+0.0015,1.2)':d={frames}:s={WIDTH}x{HEIGHT},"
                 f"format=yuv420p[v]",
                 "-map", "[v]", "-map", "1:a",
                 "-t", str(duration), "-r", str(FPS),
