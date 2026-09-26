@@ -55,6 +55,9 @@ def main():
     manifest = json.load(open("manifest.json", encoding="utf-8"))
     scenes = manifest["scenes"]
     title = manifest.get("title", "Generiertes Video")
+    manifest_settings = manifest.get("settings", {})
+    voice = manifest_settings.get("tts_voice_id") or VOICE
+    font_size = manifest_settings.get("subtitle_font_size") or "16"
 
     clip_files = []
     srt_blocks = []
@@ -67,7 +70,7 @@ def main():
 
         # 3) Sprachausgabe erzeugen (edge-tts)
         audio_path = f"scene-{i}.mp3"
-        asyncio.run(edge_tts.Communicate(scene["text"], VOICE).save(audio_path))
+        asyncio.run(edge_tts.Communicate(scene["text"], voice).save(audio_path))
         duration = ffprobe_duration(audio_path)
         frames = max(1, round(duration * FPS))
 
@@ -110,7 +113,7 @@ def main():
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", "combined.mp4",
-            "-vf", "subtitles=subs.srt:force_style='Fontsize=16,PrimaryColour=&HFFFFFF&,Outline=1,Alignment=2'",
+            "-vf", f"subtitles=subs.srt:force_style='Fontsize={font_size},PrimaryColour=&HFFFFFF&,Outline=1,Alignment=2'",
             "-c:a", "copy", "final.mp4",
         ],
         check=True,
