@@ -20,6 +20,11 @@ jobs:
       - name: Abhängigkeiten installieren
         run: pip install --quiet boto3 edge-tts
 
+      - name: FFmpeg installieren
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes ffmpeg
+
       - name: Video rendern
         env:
           VIDEO_ID: ${{ github.event.inputs.video_id }}
