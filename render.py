@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import subprocess
+import urllib.error
 import urllib.request
 
 import boto3
@@ -132,7 +133,13 @@ def main():
     req = urllib.request.Request(
         CALLBACK_URL, data=payload, headers={"Content-Type": "application/json"}
     )
-    urllib.request.urlopen(req)
+    try:
+        urllib.request.urlopen(req)
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Callback an den Worker fehlgeschlagen ({e.code}): {error_body}"
+        ) from e
 
     print("Fertig:", final_key)
 
