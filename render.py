@@ -13,12 +13,10 @@ B2_ENDPOINT = os.environ["B2_ENDPOINT"]
 B2_BUCKET = os.environ["B2_BUCKET"]
 B2_KEY_ID = os.environ["B2_KEY_ID"]
 B2_APP_KEY = os.environ["B2_APP_KEY"]
-VOICE = os.environ.get("TTS_VOICE_ID") or "de-DE-KatjaNeural"
 CALLBACK_URL = os.environ["CALLBACK_URL"]
 CALLBACK_SECRET = os.environ["CALLBACK_SECRET"]
 
-FPS = 25
-WIDTH, HEIGHT = 1080, 1920  # TikTok/Reels Hochformat
+WIDTH, HEIGHT = 1080, 1920  # 9:16, TikTok/Reels Hochformat
 
 s3 = boto3.client(
     "s3",
@@ -49,15 +47,33 @@ def srt_timestamp(t):
     return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
 
 
+def hex_to_ass_color(hex_color, fallback="&HFFFFFF&"):
+    """Wandelt '#RRGGBB' in ASS/libass-Farbformat '&HBBGGRR&' um (umgekehrte Byte-Reihenfolge)."""
+    if not hex_color:
+        return fallback
+    h = hex_color.strip().lstrip("#")
+    if len(h) != 6:
+        return fallback
+    r, g, b = h[0:2], h[2:4], h[4:6]
+    return f"&H{b}{g}{r}&".upper()
+
+
 def main():
-    # 1) Manifest herunterladen
+    # 1) Manifest herunterladen (v2: Titel, Caption, Production Bible, Szenen, globale Settings)
     s3.download_file(B2_BUCKET, f"renders/{VIDEO_ID}/manifest.json", "manifest.json")
     manifest = json.load(open("manifest.json", encoding="utf-8"))
     scenes = manifest["scenes"]
     title = manifest.get("title", "Generiertes Video")
-    manifest_settings = manifest.get("settings", {})
-    voice = manifest_settings.get("tts_voice_id") or VOICE
-    font_size = manifest_settings.get("subtitle_font_size") or "16"
+    caption = manifest.get("caption", "")
+    settings = manifest.get("settings", {})
+
+    voice = settings.get("tts_voice_id") or "de-DE-KatjaNeural"
+    fps = int(settings.get("fps") or 30)
+    font_name = settings.get("subtitle_font") or "Arial"
+    font_size = settings.get("subtitle_font_size") or "16"
+    primary_color = hex_to_ass_color(settings.get("subtitle_color"), "&HFFFFFF&")
+    position = settings.get("subtitle_position") or "bottom"
+    alignment = "5" if position == "middle" else "2"  # ASS: 2 = unten-mittig, 5 = mittig
 
     clip_files = []
     srt_blocks = []
@@ -72,9 +88,9 @@ def main():
         audio_path = f"scene-{i}.mp3"
         asyncio.run(edge_tts.Communicate(scene["text"], voice).save(audio_path))
         duration = ffprobe_duration(audio_path)
-        frames = max(1, round(duration * FPS))
+        frames = max(1, round(duration * fps))
 
-        # 4) Bild -> Videoclip mit Ken-Burns-Zoom, passend zur Sprachdauer
+        # 4) Bild -> Videoclip mit Ken-Burns-Zoom, passend zur tatsächlichen Sprachdauer
         clip_path = f"clip-{i}.mp4"
         subprocess.run(
             [
@@ -85,7 +101,7 @@ def main():
                 f"zoompan=z='min(zoom+0.0015,1.2)':d={frames}:s={WIDTH}x{HEIGHT},"
                 f"format=yuv420p[v]",
                 "-map", "[v]", "-map", "1:a",
-                "-t", str(duration), "-r", str(FPS),
+                "-t", str(duration), "-r", str(fps),
                 "-c:v", "libx264", "-c:a", "aac", "-shortest", clip_path,
             ],
             check=True,
@@ -109,27 +125,36 @@ def main():
         check=True,
     )
 
-    # 7) Untertitel einbrennen
+    # 7) Untertitel einbrennen (Schrift/Größe/Farbe/Position aus dem globalen Kanalstil)
+    force_style = (
+        f"Fontname={font_name},Fontsize={font_size},"
+        f"PrimaryColour={primary_color},Outline=1,Alignment={alignment}"
+    )
     subprocess.run(
         [
             "ffmpeg", "-y", "-i", "combined.mp4",
-            "-vf", f"subtitles=subs.srt:force_style='Fontsize={font_size},PrimaryColour=&HFFFFFF&,Outline=1,Alignment=2'",
+            "-vf", f"subtitles=subs.srt:force_style='{force_style}'",
             "-c:a", "copy", "final.mp4",
         ],
         check=True,
     )
 
-    # 8) Fertiges Video zu B2 hochladen
+    # 8) Tatsächliche Videodauer messen (Pflichtfeld für den Callback -> Mindestlängen-Check)
+    final_duration = ffprobe_duration("final.mp4")
+
+    # 9) Fertiges Video zu B2 hochladen
     final_key = f"videos/{VIDEO_ID}.mp4"
     s3.upload_file("final.mp4", B2_BUCKET, final_key, ExtraArgs={"ContentType": "video/mp4"})
 
-    # 9) Worker informieren, damit der D1-Eintrag auf "draft" gesetzt wird
+    # 10) Worker informieren (setzt Status auf "draft" oder stößt bei zu kurzer Dauer eine Regenerierung an)
     payload = json.dumps(
         {
             "id": VIDEO_ID,
             "key": final_key,
             "title": title,
             "script": " ".join(s["text"] for s in scenes),
+            "caption": caption,
+            "duration_seconds": round(final_duration, 3),
             "secret": CALLBACK_SECRET,
         }
     ).encode("utf-8")
@@ -149,7 +174,7 @@ def main():
             f"Callback an den Worker fehlgeschlagen ({e.code}): {error_body}"
         ) from e
 
-    print("Fertig:", final_key)
+    print("Fertig:", final_key, f"({final_duration:.2f}s)")
 
 
 if __name__ == "__main__":
