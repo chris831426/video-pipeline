@@ -1,3 +1,6 @@
+# render.py
+# github.com/video-pipeline
+
 import asyncio
 import json
 import os
