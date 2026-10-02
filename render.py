@@ -32,6 +32,35 @@ os.makedirs("work", exist_ok=True)
 os.chdir("work")
 
 
+class CallbackError(RuntimeError):
+    """Der Callback an den Worker selbst ist fehlgeschlagen."""
+
+
+def post_callback(payload):
+    """Meldet das Ergebnis an den Worker (/internal/render-complete).
+
+    Felder, die der Worker erwartet:
+      video_id, status ("success" | "failed"),
+      duration_seconds, b2_key (bei success), error (bei failed)
+    """
+    body = json.dumps({**payload, "secret": CALLBACK_SECRET}).encode("utf-8")
+    req = urllib.request.Request(
+        CALLBACK_URL,
+        data=body,
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "Mozilla/5.0 (compatible; VideoPipelineBot/1.0)",
+        },
+    )
+    try:
+        urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        error_body = e.read().decode("utf-8", errors="replace")
+        raise CallbackError(
+            f"Callback an den Worker fehlgeschlagen ({e.code}): {error_body}"
+        ) from e
+
+
 def ffprobe_duration(path):
     out = subprocess.run(
         [
@@ -66,8 +95,6 @@ def main():
     s3.download_file(B2_BUCKET, f"renders/{VIDEO_ID}/manifest.json", "manifest.json")
     manifest = json.load(open("manifest.json", encoding="utf-8"))
     scenes = manifest["scenes"]
-    title = manifest.get("title", "Generiertes Video")
-    caption = manifest.get("caption", "")
     settings = manifest.get("settings", {})
 
     voice = settings.get("tts_voice_id") or "de-DE-KatjaNeural"
@@ -145,40 +172,33 @@ def main():
     # 8) Tatsächliche Videodauer messen (Pflichtfeld für den Callback -> Mindestlängen-Check)
     final_duration = ffprobe_duration("final.mp4")
 
-    # 9) Fertiges Video zu B2 hochladen
-    final_key = f"videos/{VIDEO_ID}.mp4"
+    # 9) Fertiges Video zu B2 hochladen.
+    #    Liegt unter renders/<id>/, damit der B2-Cleanup im Worker es mit löscht.
+    final_key = f"renders/{VIDEO_ID}/video.mp4"
     s3.upload_file("final.mp4", B2_BUCKET, final_key, ExtraArgs={"ContentType": "video/mp4"})
 
     # 10) Worker informieren (setzt Status auf "draft" oder stößt bei zu kurzer Dauer eine Regenerierung an)
-    payload = json.dumps(
+    post_callback(
         {
-            "id": VIDEO_ID,
-            "key": final_key,
-            "title": title,
-            "script": " ".join(s["text"] for s in scenes),
-            "caption": caption,
+            "video_id": VIDEO_ID,
+            "status": "success",
             "duration_seconds": round(final_duration, 3),
-            "secret": CALLBACK_SECRET,
+            "b2_key": final_key,
         }
-    ).encode("utf-8")
-    req = urllib.request.Request(
-        CALLBACK_URL,
-        data=payload,
-        headers={
-            "Content-Type": "application/json",
-            "User-Agent": "Mozilla/5.0 (compatible; VideoPipelineBot/1.0)",
-        },
     )
-    try:
-        urllib.request.urlopen(req)
-    except urllib.error.HTTPError as e:
-        error_body = e.read().decode("utf-8", errors="replace")
-        raise RuntimeError(
-            f"Callback an den Worker fehlgeschlagen ({e.code}): {error_body}"
-        ) from e
 
     print("Fertig:", final_key, f"({final_duration:.2f}s)")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except CallbackError:
+        raise
+    except Exception as e:
+        # Fehler beim Rendern: Worker informieren, damit das Video nicht ewig auf "rendering" hängt.
+        try:
+            post_callback({"video_id": VIDEO_ID, "status": "failed", "error": str(e)[:500]})
+        except Exception as cb_err:
+            print("Fehler-Callback ebenfalls fehlgeschlagen:", cb_err)
+        raise
