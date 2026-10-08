@@ -1,9 +1,19 @@
 # render.py
-# github.com/video-pipeline
+# Rendert das Video mit Remotion (React-Animationen) statt mit ffmpeg-Standbildern.
+#
+# Ablauf:
+#   1) Manifest (Szenen mit Text, Icon, Stimmung) aus B2 laden
+#   2) Pro Szene Sprachausgabe mit Wortzeiten (edge-tts) erzeugen
+#   3) Emoji-Grafiken (Noto, SVG) aus node_modules nach public/emoji kopieren
+#   4) props.json schreiben und `remotion render` aufrufen
+#   5) Video nach B2 hochladen und den Worker informieren
 
 import asyncio
 import json
+import math
 import os
+import pathlib
+import re
 import subprocess
 import urllib.error
 import urllib.request
@@ -19,7 +29,14 @@ B2_APP_KEY = os.environ["B2_APP_KEY"]
 CALLBACK_URL = os.environ["CALLBACK_URL"]
 CALLBACK_SECRET = os.environ["CALLBACK_SECRET"]
 
-WIDTH, HEIGHT = 1080, 1920  # 9:16, TikTok/Reels Hochformat
+ROOT = pathlib.Path(__file__).resolve().parent
+PUBLIC = ROOT / "public"
+WORK = ROOT / "work"
+OUT = ROOT / "out"
+SPRITE = ROOT / "node_modules" / "@svgmoji" / "noto" / "sprites" / "all.svg"
+
+SCENE_PAD_SECONDS = 0.25  # kurze Pause nach jeder Szene
+FALLBACK_EMOJI = "\u2754"  # ❔
 
 s3 = boto3.client(
     "s3",
@@ -27,9 +44,6 @@ s3 = boto3.client(
     aws_access_key_id=B2_KEY_ID,
     aws_secret_access_key=B2_APP_KEY,
 )
-
-os.makedirs("work", exist_ok=True)
-os.chdir("work")
 
 
 class CallbackError(RuntimeError):
@@ -65,119 +79,203 @@ def ffprobe_duration(path):
     out = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", path,
+            "-of", "default=noprint_wrappers=1:nokey=1", str(path),
         ],
         capture_output=True, text=True, check=True,
     )
     return float(out.stdout.strip())
 
 
-def srt_timestamp(t):
-    h = int(t // 3600)
-    m = int((t % 3600) // 60)
-    s = t % 60
-    return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
+# ---------------------------------------------------------------- Emoji
+
+_sprite_text = None
 
 
-def hex_to_ass_color(hex_color, fallback="&HFFFFFF&"):
-    """Wandelt '#RRGGBB' in ASS/libass-Farbformat '&HBBGGRR&' um (umgekehrte Byte-Reihenfolge)."""
-    if not hex_color:
-        return fallback
-    h = hex_color.strip().lstrip("#")
-    if len(h) != 6:
-        return fallback
-    r, g, b = h[0:2], h[2:4], h[4:6]
-    return f"&H{b}{g}{r}&".upper()
+def _sprite():
+    global _sprite_text
+    if _sprite_text is None:
+        _sprite_text = SPRITE.read_text(encoding="utf-8")
+    return _sprite_text
 
+
+def _find_emoji_id(emoji):
+    """Sucht die Sprite-ID zu einem Emoji (z.B. '1F511' oder '1F56F')."""
+    sprite = _sprite()
+    cps = [f"{ord(c):04X}" for c in emoji]
+    candidates = [
+        "-".join(cps),
+        "-".join(c for c in cps if c != "FE0F"),
+    ]
+    if len(cps) == 1:
+        candidates.append(cps[0] + "-FE0F")
+    for cand in candidates:
+        if cand and f'id="{cand}"' in sprite:
+            return cand
+    return None
+
+
+def emoji_file(emoji):
+    """Schreibt die SVG des Emojis nach public/emoji und gibt den Pfad relativ zu public/ zurück."""
+    emoji = (emoji or "").strip() or FALLBACK_EMOJI
+    emoji_id = _find_emoji_id(emoji) or _find_emoji_id(FALLBACK_EMOJI)
+    rel = f"emoji/{emoji_id}.svg"
+    target = PUBLIC / rel
+    if not target.exists():
+        sprite = _sprite()
+        idx = sprite.index(f'id="{emoji_id}"')
+        start = sprite.rfind("<svg", 0, idx)
+        end = sprite.index("</svg>", idx) + len("</svg>")
+        svg = sprite[start:end].replace(
+            "<svg ", '<svg xmlns:xlink="http://www.w3.org/1999/xlink" ', 1
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(svg, encoding="utf-8")
+    return rel
+
+
+# ---------------------------------------------------------------- Sprache
+
+async def synthesize(text, voice, path):
+    """Erzeugt die MP3 und gibt die Wortgrenzen [{text,start,end}] in Sekunden zurück."""
+    try:
+        comm = edge_tts.Communicate(text, voice, boundary="WordBoundary")
+    except TypeError:  # ältere edge-tts-Versionen
+        comm = edge_tts.Communicate(text, voice)
+    words = []
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "wb") as f:
+        async for chunk in comm.stream():
+            if chunk["type"] == "audio":
+                f.write(chunk["data"])
+            elif chunk["type"] in ("WordBoundary", "SentenceBoundary"):
+                start = chunk["offset"] / 1e7
+                words.append(
+                    {
+                        "text": chunk.get("text", ""),
+                        "start": start,
+                        "end": start + chunk["duration"] / 1e7,
+                    }
+                )
+    return words
+
+
+def align_words(text, raw, audio_duration):
+    """Ordnet jedem Wort des Originaltexts (mit Satzzeichen) eine Zeit zu."""
+    tokens = text.split()
+    if not tokens:
+        return []
+    if raw and len(raw) == len(tokens):
+        return [
+            {
+                "text": tok,
+                "start": round(r["start"], 3),
+                "end": round(min(r["end"], audio_duration), 3),
+            }
+            for tok, r in zip(tokens, raw)
+        ]
+    # Fallback: gleichmäßig nach Wortlänge über den gesprochenen Bereich verteilen
+    t0 = raw[0]["start"] if raw else 0.0
+    t1 = raw[-1]["end"] if raw else audio_duration
+    if t1 <= t0:
+        t1 = audio_duration
+    weights = [len(t) + 2 for t in tokens]
+    total = sum(weights)
+    out, cur = [], t0
+    for tok, w in zip(tokens, weights):
+        span = (t1 - t0) * w / total
+        out.append(
+            {
+                "text": tok,
+                "start": round(cur, 3),
+                "end": round(min(cur + span, audio_duration), 3),
+            }
+        )
+        cur += span
+    return out
+
+
+# ---------------------------------------------------------------- Stil
+
+def clean_color(value, fallback):
+    if isinstance(value, str) and re.fullmatch(r"#[0-9a-fA-F]{6}", value.strip()):
+        return value.strip()
+    return fallback
+
+
+# ---------------------------------------------------------------- Hauptablauf
 
 def main():
-    # 1) Manifest herunterladen (v2: Titel, Caption, Production Bible, Szenen, globale Settings)
-    s3.download_file(B2_BUCKET, f"renders/{VIDEO_ID}/manifest.json", "manifest.json")
-    manifest = json.load(open("manifest.json", encoding="utf-8"))
+    WORK.mkdir(exist_ok=True)
+    OUT.mkdir(exist_ok=True)
+    PUBLIC.mkdir(exist_ok=True)
+
+    # 1) Manifest herunterladen
+    manifest_path = WORK / "manifest.json"
+    s3.download_file(B2_BUCKET, f"renders/{VIDEO_ID}/manifest.json", str(manifest_path))
+    manifest = json.load(open(manifest_path, encoding="utf-8"))
     scenes = manifest["scenes"]
     settings = manifest.get("settings", {})
 
     voice = settings.get("tts_voice_id") or "de-DE-KatjaNeural"
     fps = int(settings.get("fps") or 30)
-    font_name = settings.get("subtitle_font") or "Arial"
-    font_size = settings.get("subtitle_font_size") or "16"
-    primary_color = hex_to_ass_color(settings.get("subtitle_color"), "&HFFFFFF&")
-    position = settings.get("subtitle_position") or "bottom"
-    alignment = "5" if position == "middle" else "2"  # ASS: 2 = unten-mittig, 5 = mittig
 
-    clip_files = []
-    srt_blocks = []
-    t_cursor = 0.0
-
+    scenes_out = []
     for i, scene in enumerate(scenes):
-        # 2) Szenenbild herunterladen
-        img_path = f"scene-{i}.jpg"
-        s3.download_file(B2_BUCKET, scene["image_key"], img_path)
+        # 2) Sprachausgabe mit Wortzeiten
+        audio_rel = f"audio/scene-{i}.mp3"
+        raw_words = asyncio.run(synthesize(scene["text"], voice, PUBLIC / audio_rel))
+        audio_duration = ffprobe_duration(PUBLIC / audio_rel)
+        words = align_words(scene["text"], raw_words, audio_duration)
 
-        # 3) Sprachausgabe erzeugen (edge-tts)
-        audio_path = f"scene-{i}.mp3"
-        asyncio.run(edge_tts.Communicate(scene["text"], voice).save(audio_path))
-        duration = ffprobe_duration(audio_path)
-        frames = max(1, round(duration * fps))
+        # 3) Emoji-Grafiken
+        icon = emoji_file(scene.get("icon"))
+        extra = [emoji_file(e) for e in (scene.get("extra_icons") or [])[:2]]
 
-        # 4) Bild -> Videoclip mit Ken-Burns-Zoom, passend zur tatsächlichen Sprachdauer
-        clip_path = f"clip-{i}.mp4"
-        subprocess.run(
-            [
-                "ffmpeg", "-y", "-loop", "1", "-i", img_path, "-i", audio_path,
-                "-filter_complex",
-                f"[0:v]scale={WIDTH}:{HEIGHT}:force_original_aspect_ratio=increase,"
-                f"crop={WIDTH}:{HEIGHT},"
-                f"zoompan=z='min(zoom+0.0015,1.2)':d={frames}:s={WIDTH}x{HEIGHT},"
-                f"format=yuv420p[v]",
-                "-map", "[v]", "-map", "1:a",
-                "-t", str(duration), "-r", str(fps),
-                "-c:v", "libx264", "-c:a", "aac", "-shortest", clip_path,
-            ],
-            check=True,
+        scenes_out.append(
+            {
+                "id": scene.get("id") or f"scene_{i + 1}",
+                "icon": icon,
+                "extraIcons": extra,
+                "mood": scene.get("mood") or "mystery",
+                "label": (scene.get("label") or "")[:40],
+                "durationInFrames": max(1, math.ceil((audio_duration + SCENE_PAD_SECONDS) * fps)),
+                "audio": audio_rel,
+                "words": words,
+            }
         )
-        clip_files.append(clip_path)
 
-        # 5) Untertitel-Block für diese Szene (ganzer Satz für die Szenendauer)
-        start, end = t_cursor, t_cursor + duration
-        srt_blocks.append(f"{i + 1}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{scene['text']}\n")
-        t_cursor = end
+    # 4) Props schreiben und mit Remotion rendern
+    props = {
+        "fps": fps,
+        "scenes": scenes_out,
+        "style": {
+            "subtitleColor": clean_color(settings.get("subtitle_color"), "#FFFFFF"),
+            "accentColor": clean_color(settings.get("subtitle_accent_color"), "#FFD84D"),
+            "subtitlePosition": "middle" if settings.get("subtitle_position") == "middle" else "bottom",
+        },
+    }
+    props_path = WORK / "props.json"
+    props_path.write_text(json.dumps(props, ensure_ascii=False), encoding="utf-8")
 
-    with open("subs.srt", "w", encoding="utf-8") as f:
-        f.write("\n".join(srt_blocks))
-
-    # 6) Alle Szenen-Clips verketten
-    with open("concat.txt", "w", encoding="utf-8") as f:
-        for c in clip_files:
-            f.write(f"file '{c}'\n")
-    subprocess.run(
-        ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", "concat.txt", "-c", "copy", "combined.mp4"],
-        check=True,
-    )
-
-    # 7) Untertitel einbrennen (Schrift/Größe/Farbe/Position aus dem globalen Kanalstil)
-    force_style = (
-        f"Fontname={font_name},Fontsize={font_size},"
-        f"PrimaryColour={primary_color},Outline=1,Alignment={alignment}"
-    )
+    final_path = OUT / "final.mp4"
     subprocess.run(
         [
-            "ffmpeg", "-y", "-i", "combined.mp4",
-            "-vf", f"subtitles=subs.srt:force_style='{force_style}'",
-            "-c:a", "copy", "final.mp4",
+            "npx", "remotion", "render", "src/index.ts", "Main", str(final_path),
+            f"--props={props_path}", "--crf=21", "--log=info",
         ],
+        cwd=ROOT,
         check=True,
     )
 
-    # 8) Tatsächliche Videodauer messen (Pflichtfeld für den Callback -> Mindestlängen-Check)
-    final_duration = ffprobe_duration("final.mp4")
+    # 5) Tatsächliche Videodauer messen (Pflichtfeld für den Callback -> Mindestlängen-Check)
+    final_duration = ffprobe_duration(final_path)
 
-    # 9) Fertiges Video zu B2 hochladen.
+    # 6) Fertiges Video zu B2 hochladen.
     #    Liegt unter renders/<id>/, damit der B2-Cleanup im Worker es mit löscht.
     final_key = f"renders/{VIDEO_ID}/video.mp4"
-    s3.upload_file("final.mp4", B2_BUCKET, final_key, ExtraArgs={"ContentType": "video/mp4"})
+    s3.upload_file(str(final_path), B2_BUCKET, final_key, ExtraArgs={"ContentType": "video/mp4"})
 
-    # 10) Worker informieren (setzt Status auf "draft" oder stößt bei zu kurzer Dauer eine Regenerierung an)
+    # 7) Worker informieren
     post_callback(
         {
             "video_id": VIDEO_ID,
