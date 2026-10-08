@@ -1,6 +1,4 @@
-# .github/workflows/render,yml
-# github.com/video-pipeline
-
+# .github/workflows/render.yml
 name: Render Video
 
 on:
@@ -13,6 +11,7 @@ on:
 jobs:
   render:
     runs-on: ubuntu-latest
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
 
@@ -20,11 +19,22 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Abhängigkeiten installieren
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Systempakete installieren (ffprobe + Chrome-Abhängigkeiten für Remotion)
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y ffmpeg
-          pip install --quiet boto3 edge-tts
+          sudo apt-get install -y ffmpeg libnss3 libdbus-1-3 libatk1.0-0 libgbm-dev \
+            libasound2t64 libxrandr2 libxkbcommon-dev libxfixes3 libxcomposite1 \
+            libxdamage1 libatk-bridge2.0-0 libpango-1.0-0 libcairo2 libcups2
+
+      - name: Python-Abhängigkeiten installieren
+        run: pip install --quiet boto3 edge-tts
+
+      - name: Node-Abhängigkeiten installieren
+        run: npm install --no-audit --no-fund
 
       - name: Video rendern
         env:
@@ -33,7 +43,6 @@ jobs:
           B2_BUCKET: ${{ secrets.B2_BUCKET }}
           B2_KEY_ID: ${{ secrets.B2_KEY_ID }}
           B2_APP_KEY: ${{ secrets.B2_APP_KEY }}
-          TTS_VOICE_ID: ${{ vars.TTS_VOICE_ID }}
           CALLBACK_URL: ${{ secrets.CALLBACK_URL }}
           CALLBACK_SECRET: ${{ secrets.CALLBACK_SECRET }}
         run: python render.py
